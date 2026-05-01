@@ -1,238 +1,195 @@
 #!/usr/bin/env python3
 """
-Sultan Roulette Monitor
-Monitorea roulette.betandhold.com y avisa por Telegram cuando:
-- La barra "Lucky" está en verde (oportunidad alta)
-- La barra "Risky" está en verde (jackpot cerca)
-- Letras del jackpot se iluminan
+Sultan Crash Monitor - Crashing Train (Hashes Games)
+Alertas de probabilidad acumulada para x25, x50, x100
 """
 
 import asyncio
-import os
+import json
 import logging
-from playwright.async_api import async_playwright
 import aiohttp
+import websockets
 
-# ── CONFIGURACIÓN ──────────────────────────────────────────────
 TELEGRAM_TOKEN = "8338023730:AAFSmB04tSjxkg8vn1wj1sPON0mquz-ORvQ"
 CHAT_ID = "7706931467"
-ROULETTE_URL = "https://roulette.betandhold.com/?ref=0x832e14f204d3cb19E67E1a614582357e0faE10ba"
-CHECK_INTERVAL = 3  # segundos entre cada chequeo
-# ───────────────────────────────────────────────────────────────
+WS_URL = "wss://crashdata.hashesgames.com/socket.io/?EIO=4&transport=websocket"
+
+# Umbrales ajustados
+TARGETS = [
+    {"key": "x25",  "mult": 25,  "alert": 99.0, "urgent": 99.6},
+    {"key": "x50",  "mult": 50,  "alert": 99.0, "urgent": 99.6},
+    {"key": "x100", "mult": 100, "alert": 99.0, "urgent": 99.6},
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
+history = []
+MAX_HISTORY = 1000
+last_alerts = {}
 
-async def send_telegram(session: aiohttp.ClientSession, message: str):
+
+def calc_prob(multiplier: float, results: list) -> tuple:
+    """
+    Retorna (probabilidad_acumulada, rondas_sin_salir)
+    """
+    misses = 0
+    for r in reversed(results):
+        if r >= multiplier:
+            break
+        misses += 1
+
+    if misses == 0:
+        return 0.0, 0
+
+    base_prob = 1.0 / multiplier
+    cumulative = 1.0 - (1.0 - base_prob) ** misses
+    return round(cumulative * 100, 2), misses
+
+
+async def send_telegram(session, msg, priority=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": message,
+        "text": msg,
         "parse_mode": "HTML",
+        "disable_notification": not priority
     }
     try:
-        async with session.post(url, json=payload) as r:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status == 200:
-                log.info(f"✅ Telegram enviado: {message[:60]}")
-            else:
-                log.warning(f"Telegram error {r.status}: {await r.text()}")
+                log.info(f"✅ Enviado: {msg[:60]}")
     except Exception as e:
-        log.error(f"Error enviando Telegram: {e}")
+        log.error(f"Error Telegram: {e}")
 
 
-def parse_bar_value(style: str) -> float:
-    """Extrae el porcentaje de una barra de progreso desde su style."""
-    import re
-    match = re.search(r'width:\s*([\d.]+)%', style or "")
-    if match:
-        return float(match.group(1))
-    return 0.0
+async def check_alerts(session, crashed_at: float):
+    for t in TARGETS:
+        mult = t["mult"]
+        key = t["key"]
+        prob, misses = calc_prob(mult, history)
+
+        # Alerta URGENTE 99.6%
+        if prob >= t["urgent"]:
+            alert_key = f"{key}_urgent_{misses // 5}"
+            if alert_key not in last_alerts:
+                msg = (
+                    f"🚨🔥 <b>URGENTE - {key.upper()}!</b>\n\n"
+                    f"📊 Probabilidad: <b>{prob}%</b>\n"
+                    f"🎯 Objetivo: ×{mult}\n"
+                    f"🔢 Rondas sin salir: <b>{misses}</b>\n"
+                    f"📉 Último crash: ×{crashed_at}\n\n"
+                    f"⚡ <b>¡MÁXIMA OPORTUNIDAD - JUGÁ AHORA!</b>"
+                )
+                await send_telegram(session, msg, priority=True)
+                last_alerts[alert_key] = True
+                last_alerts.pop(f"{key}_alert_{misses // 5}", None)
+
+        # Alerta NORMAL 99%
+        elif prob >= t["alert"]:
+            alert_key = f"{key}_alert_{misses // 5}"
+            if alert_key not in last_alerts:
+                msg = (
+                    f"⚠️ <b>ALERTA - {key.upper()}</b>\n\n"
+                    f"📊 Probabilidad: <b>{prob}%</b>\n"
+                    f"🎯 Objetivo: ×{mult}\n"
+                    f"🔢 Rondas sin salir: <b>{misses}</b>\n"
+                    f"📉 Último crash: ×{crashed_at}\n\n"
+                    f"👀 Probabilidad muy alta, prestá atención"
+                )
+                await send_telegram(session, msg, priority=True)
+                last_alerts[alert_key] = True
+
+        else:
+            # Limpiar alertas cuando el multiplicador salió
+            for k in list(last_alerts.keys()):
+                if k.startswith(key):
+                    last_alerts.pop(k)
+
+
+async def status_update(session):
+    """Resumen cada hora"""
+    await asyncio.sleep(300)  # primera en 5 min
+    while True:
+        if history:
+            lines = ["📊 <b>Sultan Monitor - Estado actual</b>\n"]
+            for t in TARGETS:
+                prob, misses = calc_prob(t["mult"], history)
+                if prob >= 99.6:
+                    emoji = "🔴"
+                elif prob >= 99.0:
+                    emoji = "🟡"
+                elif prob >= 90:
+                    emoji = "🟠"
+                else:
+                    emoji = "🟢"
+                lines.append(f"{emoji} ×{t['mult']}: {prob}% ({misses} rondas sin salir)")
+            lines.append(f"\n📈 Rondas analizadas: {len(history)}")
+            lines.append(f"📉 Último crash: ×{history[-1]}")
+            await send_telegram(session, "\n".join(lines))
+        await asyncio.sleep(3600)  # cada hora
 
 
 async def monitor():
-    last_alerts = {}  # evita spam de alertas repetidas
+    async with aiohttp.ClientSession() as http:
+        await send_telegram(http,
+            "🟢 <b>Sultan Crash Monitor INICIADO</b>\n"
+            "📡 Conectado a Crashing Train - Hashes Games\n"
+            "🎯 Monitoreando: ×25, ×50, ×100\n"
+            "⚠️ Alerta a 99% de prob. acumulada\n"
+            "🚨 Urgente a 99.6% de prob. acumulada",
+            priority=True)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
-        page = await context.new_page()
+        asyncio.create_task(status_update(http))
 
-        log.info("Abriendo página...")
-        await page.goto(ROULETTE_URL, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(5)  # espera que cargue bien
+        while True:
+            try:
+                log.info("Conectando WebSocket...")
+                async with websockets.connect(
+                    WS_URL,
+                    extra_headers={
+                        "Origin": "https://crash.hashesgames.com",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    },
+                    ping_interval=20,
+                    ping_timeout=10
+                ) as ws:
+                    log.info("✅ WebSocket conectado")
 
-        async with aiohttp.ClientSession() as http:
-            await send_telegram(http, "🟢 Sultan Monitor INICIADO\nMonitoreando roulette.betandhold.com 24/7")
-            log.info("Monitor activo")
+                    async for raw in ws:
+                        try:
+                            if isinstance(raw, str):
+                                if raw == "2":
+                                    await ws.send("3")
+                                    continue
 
-            while True:
-                try:
-                    alerts = []
+                                if raw.startswith("42"):
+                                    data = json.loads(raw[2:])
+                                    event = data[0]
+                                    payload = data[1] if len(data) > 1 else {}
 
-                    # ── Intentar leer datos desde el DOM / JavaScript ──
-                    # Buscar barras de progreso por colores o atributos
-                    
-                    # Método 1: buscar elementos con texto Lucky/Risky y leer valores numéricos cercanos
-                    page_text = await page.evaluate("() => document.body.innerText")
-                    
-                    # Buscar valores de Lucky y Risky en el texto
-                    import re
-                    
-                    lucky_match = re.search(r'Lucky\s*\n?\s*(\d+)\s*/\s*(\d+)', page_text, re.IGNORECASE)
-                    risky_match = re.search(r'Risky\s*\n?\s*(\d+)\s*/\s*(\d+)', page_text, re.IGNORECASE)
-                    
-                    # Método 2: leer estado visual buscando elementos coloreados
-                    # Intentar obtener el color actual de las barras via JavaScript
-                    bar_data = await page.evaluate("""() => {
-                        const result = {};
-                        
-                        // Buscar todos los elementos y sus colores
-                        const allElements = document.querySelectorAll('*');
-                        
-                        for (const el of allElements) {
-                            const text = el.innerText || el.textContent || '';
-                            const style = window.getComputedStyle(el);
-                            
-                            // Buscar barra Lucky
-                            if (text.trim().toLowerCase().includes('lucky')) {
-                                // Buscar el siguiente elemento que sea una barra
-                                const parent = el.closest('[class*="bar"], [class*="progress"], [class*="meter"], [class*="fill"]') 
-                                            || el.parentElement;
-                                if (parent) {
-                                    result.lucky_html = parent.outerHTML.substring(0, 500);
-                                }
-                            }
-                            
-                            // Buscar barra Risky  
-                            if (text.trim().toLowerCase().includes('risky')) {
-                                const parent = el.closest('[class*="bar"], [class*="progress"], [class*="meter"], [class*="fill"]')
-                                            || el.parentElement;
-                                if (parent) {
-                                    result.risky_html = parent.outerHTML.substring(0, 500);
-                                }
-                            }
-                        }
-                        
-                        // Buscar elementos verdes (RGB verde dominante)
-                        const greenElements = [];
-                        for (const el of allElements) {
-                            const bg = style.backgroundColor;
-                            const color = style.color;
-                            if (bg && bg.includes('rgb')) {
-                                const nums = bg.match(/\d+/g);
-                                if (nums && nums.length >= 3) {
-                                    const [r, g, b] = nums.map(Number);
-                                    // Verde: G dominante, mayor que R y B
-                                    if (g > 100 && g > r * 1.5 && g > b * 1.5) {
-                                        const txt = el.innerText?.trim().substring(0, 30);
-                                        if (txt) greenElements.push(txt);
-                                    }
-                                }
-                            }
-                        }
-                        result.green_elements = [...new Set(greenElements)].slice(0, 10);
-                        
-                        // Buscar el pozo/jackpot amount
-                        const amounts = [];
-                        document.querySelectorAll('[class*="jackpot"], [class*="prize"], [class*="pool"], [class*="pot"]').forEach(el => {
-                            const txt = el.innerText?.trim();
-                            if (txt) amounts.push(txt);
-                        });
-                        result.jackpot_amounts = amounts.slice(0, 5);
-                        
-                        // Buscar letras iluminadas del jackpot
-                        const litLetters = [];
-                        document.querySelectorAll('[class*="letter"], [class*="char"]').forEach(el => {
-                            const bg = window.getComputedStyle(el).backgroundColor;
-                            const nums = bg?.match(/\d+/g);
-                            if (nums && nums.length >= 3) {
-                                const [r, g, b] = nums.map(Number);
-                                if (g > 100 && g > r * 1.3) {
-                                    litLetters.push(el.innerText?.trim());
-                                }
-                            }
-                        });
-                        result.lit_letters = litLetters;
-                        
-                        return result;
-                    }""")
+                                    if event == "gameStatus" and isinstance(payload, dict):
+                                        status = payload.get("status", "")
 
-                    # Procesar resultados
-                    green_els = bar_data.get('green_elements', [])
-                    jackpot_amounts = bar_data.get('jackpot_amounts', [])
-                    lit_letters = bar_data.get('lit_letters', [])
+                                        if status in ("crashed", "ended"):
+                                            val = payload.get("crashedAt") or payload.get("multiplier")
+                                            if val:
+                                                crashed_at = round(float(val), 2)
+                                                history.append(crashed_at)
+                                                if len(history) > MAX_HISTORY:
+                                                    history.pop(0)
+                                                log.info(f"💥 ×{crashed_at} | {len(history)} rondas")
+                                                await check_alerts(http, crashed_at)
 
-                    # Analizar texto de la página para valores numéricos
-                    lucky_val = 0
-                    risky_val = 0
-                    
-                    if lucky_match:
-                        lucky_val = int(lucky_match.group(1))
-                        lucky_max = int(lucky_match.group(2))
-                        lucky_pct = (lucky_val / lucky_max) * 100 if lucky_max > 0 else 0
-                    
-                    if risky_match:
-                        risky_val = int(risky_match.group(1))
-                        risky_max = int(risky_match.group(2))
-                        risky_pct = (risky_val / risky_max) * 100 if risky_max > 0 else 0
+                                        elif status == "running":
+                                            log.debug(f"🚀 ×{payload.get('multiplier', '?')}")
 
-                    log.info(f"Verde detectado: {green_els} | Jackpot: {jackpot_amounts}")
+                        except Exception as e:
+                            log.error(f"Error msg: {e}")
 
-                    # ── Generar alertas ──
-                    
-                    # Alerta si hay elementos verdes (barras en verde)
-                    if green_els:
-                        alert_key = f"green_{','.join(green_els[:3])}"
-                        if last_alerts.get(alert_key) != True:
-                            jackpot_txt = ', '.join(jackpot_amounts) if jackpot_amounts else 'N/A'
-                            msg = (
-                                "🟢🔔 <b>SULTAN ALERT - BARRA EN VERDE!</b>\n\n"
-                                f"✅ Elementos verdes: {', '.join(green_els[:5])}\n"
-                                f"💰 Pozo actual: {jackpot_txt}\n"
-                                f"⚡ ¡Momento de jugar!\n\n"
-                                f"🎰 roulette.betandhold.com"
-                            )
-                            alerts.append(msg)
-                            last_alerts[alert_key] = True
-                    else:
-                        # Reset alertas cuando no hay verde
-                        for key in list(last_alerts.keys()):
-                            if key.startswith("green_"):
-                                last_alerts.pop(key, None)
-
-                    # Alerta por letras iluminadas
-                    if lit_letters:
-                        letters_key = f"letters_{''.join(lit_letters)}"
-                        if last_alerts.get(letters_key) != True:
-                            msg = (
-                                "🔥 <b>LETRAS ILUMINADAS!</b>\n\n"
-                                f"📝 Letras activas: {' '.join(lit_letters)}\n"
-                                f"💰 Pozo: {', '.join(jackpot_amounts) if jackpot_amounts else 'N/A'}\n"
-                                "⚡ ¡Jackpot acercándose!"
-                            )
-                            alerts.append(msg)
-                            last_alerts[letters_key] = True
-
-                    # Enviar alertas
-                    for alert in alerts:
-                        await send_telegram(http, alert)
-
-                except Exception as e:
-                    log.error(f"Error en ciclo: {e}")
-                    # Si la página se cayó, intentar recargar
-                    try:
-                        await page.reload(wait_until="networkidle", timeout=30000)
-                        await asyncio.sleep(5)
-                    except:
-                        pass
-
-                await asyncio.sleep(CHECK_INTERVAL)
-
-        await browser.close()
+            except Exception as e:
+                log.error(f"Error WS: {e}")
+                await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
